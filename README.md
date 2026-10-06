@@ -249,7 +249,9 @@ server.RegisterHandler(gofins.CmdMemoryRead, func(req gofins.Request) ([]byte, e
 
 ## Error Handling
 
-All errors are typed for programmatic handling:
+All errors are typed for programmatic handling. FINS/TCP **connection-level** errors (node address
+conflicts, connection limits, bad header…) are reported as `TCPError` — they used to be ignored, so
+the caller only saw a response timeout:
 
 ```go
 words, err := client.ReadWords(gofins.MemAreaDM, 100, 10)
@@ -257,6 +259,8 @@ if err != nil {
     switch e := err.(type) {
     case gofins.EndCodeError:
         fmt.Printf("PLC error: %s (0x%04X)\n", e.Error(), e.Code)
+    case gofins.TCPError:
+        fmt.Printf("FINS/TCP error 0x%02X during %s\n", e.Code, e.Stage)
     case gofins.ResponseTimeoutError:
         fmt.Printf("Timeout after %v\n", e.Duration)
     case gofins.IncompatibleMemoryAreaError:

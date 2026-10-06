@@ -1,5 +1,7 @@
 package gofins
 
+import "fmt"
+
 // Command codes (Omron FINS specification, Cat. No. W342-E1-15)
 const (
 	CmdMemoryRead           uint16 = 0x0101 // IO memory area read
@@ -152,6 +154,49 @@ const (
 
 // 说明：完整的 end code → 文本表在 endcodes.go（EndCodeToString 由那里提供，
 // 覆盖 W342-E1-15 全部 85 个码，未知码也带上 16 进制）。
+
+// FINS/TCP 头里的 Error Code 字段（第 12-15 字节）——与 FINS end code 不是一套。
+// 十进制/十六进制取值与文本参考 Omron W342 第 8 章与 ping9719/IoT 的 C# 实现。
+const (
+	TCPErrNone                uint32 = 0x00 // 正常
+	TCPErrNotFINSHeader       uint32 = 0x01 // 头不是 FINS 格式
+	TCPErrDataTooLong         uint32 = 0x02 // 数据长度过长
+	TCPErrCommandNotSupported uint32 = 0x03 // 命令不被支持
+	TCPErrConnectionInUse     uint32 = 0x20 // 所有连接都被占用
+	TCPErrNodeAlreadyConnect  uint32 = 0x21 // 该节点已连接
+	TCPErrProtectedNode       uint32 = 0x22 // 从未指定 IP 访问受保护节点
+	TCPErrNodeOutOfRange      uint32 = 0x23 // 客户端 FINS 节点地址超出范围
+	TCPErrSameNodeAddress     uint32 = 0x24 // 客户端与服务器 FINS 节点地址相同
+	TCPErrNoFreeNodeAddress   uint32 = 0x25 // 可分配的节点地址已用尽
+)
+
+// TCPErrorCodeToString 把 FINS/TCP Error Code 翻成可读文本（未知码带 16 进制）。
+func TCPErrorCodeToString(code uint32) string {
+	switch code {
+	case TCPErrNone:
+		return "normal"
+	case TCPErrNotFINSHeader:
+		return "header is not FINS (ASCII)"
+	case TCPErrDataTooLong:
+		return "data length too long"
+	case TCPErrCommandNotSupported:
+		return "command not supported"
+	case TCPErrConnectionInUse:
+		return "all connections are in use"
+	case TCPErrNodeAlreadyConnect:
+		return "the specified node is already connected"
+	case TCPErrProtectedNode:
+		return "attempt to access a protected node from an unspecified IP address"
+	case TCPErrNodeOutOfRange:
+		return "client FINS node address is out of range"
+	case TCPErrSameNodeAddress:
+		return "the same FINS node address is used by client and server"
+	case TCPErrNoFreeNodeAddress:
+		return "all node addresses available for allocation have been used"
+	default:
+		return fmt.Sprintf("unknown FINS/TCP error (0x%02X)", code)
+	}
+}
 
 // MemoryAreaToString returns a human-readable name for the memory area.
 func MemoryAreaToString(area MemoryArea) string {

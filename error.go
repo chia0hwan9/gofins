@@ -49,6 +49,19 @@ func (e ProtocolError) Error() string {
 	return "FINS protocol error: " + e.Msg
 }
 
+// TCPError is a FINS/TCP layer error (the Error Code field of the 16-byte FINS/TCP
+// header, bytes 12-15), as opposed to a FINS end code.
+// 连接级问题（节点地址冲突、连接数占满…）都在这一层报，之前被忽略：调用方只能等到
+// 响应超时，看不出真正原因。
+type TCPError struct {
+	Code  uint32
+	Stage string // "handshake" / "data"
+}
+
+func (e TCPError) Error() string {
+	return fmt.Sprintf("FINS/TCP error 0x%02X at %s: %s", e.Code, e.Stage, TCPErrorCodeToString(e.Code))
+}
+
 // InvalidAddressError is for invalid memory address/area.
 type InvalidAddressError struct {
 	Area    MemoryArea

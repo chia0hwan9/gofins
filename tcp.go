@@ -57,8 +57,14 @@ type TCPTransport struct {
 	closed   bool
 	stopKeep chan struct{}
 
-	resp   map[byte]chan Response
+	resp   map[byte]chan tcpResult
 	respMu sync.Mutex
+}
+
+// tcpResult 是响应或连接层错误（FINS/TCP Error Code 非 0 时没有可用的 FINS 响应）。
+type tcpResult struct {
+	resp Response
+	err  error
 }
 
 // NewTCPTransport creates a new TCP transport. Call Connect() before using.
@@ -70,7 +76,7 @@ func NewTCPTransport(addr string, srcNode, srcUnit, srcNetwork byte) *TCPTranspo
 		unit:    srcUnit,
 		netw:    srcNetwork,
 		timeout: defaultResponseTimeout,
-		resp:    make(map[byte]chan Response),
+		resp:    make(map[byte]chan tcpResult),
 	}
 }
 
@@ -158,7 +164,7 @@ func (t *TCPTransport) handshakeLocked() error {
 		return ProtocolError{Msg: fmt.Sprintf("invalid handshake response: command %d, want %d", cmd, finsCmdHandshakeRsp)}
 	}
 	if code := binary.BigEndian.Uint32(resp[12:16]); code != 0 {
-		return ProtocolError{Msg: fmt.Sprintf("handshake rejected by PLC: error code %d", code)}
+		return TCPError{Code: code, Stage: "handshake"}
 	}
 
 	// Extract assigned node numbers
@@ -201,7 +207,7 @@ func (t *TCPTransport) Send(frame []byte) ([]byte, error) {
 	wrappedFrame := wrapFINSTCPFrame(payload)
 
 	// Create response channel before sending
-	respCh := make(chan Response, 1)
+	respCh := make(chan tcpResult, 1)
 	t.respMu.Lock()
 	t.resp[sid] = respCh
 	t.respMu.Unlock()
@@ -221,11 +227,14 @@ func (t *TCPTransport) Send(frame []byte) ([]byte, error) {
 
 	// Wait for response
 	select {
-	case resp, ok := <-respCh:
+	case r, ok := <-respCh:
 		if !ok {
 			return nil, ConnectionClosedError{}
 		}
-		return EncodeResponse(resp), nil
+		if r.err != nil {
+			return nil, r.err
+		}
+		return EncodeResponse(r.resp), nil
 	case <-time.After(t.timeout):
 		return nil, ResponseTimeoutError{Duration: t.timeout}
 	}
@@ -273,8 +282,16 @@ func (t *TCPTransport) listenLoop() {
 		if len(frameData) < 16 {
 			continue
 		}
-		rawFINS := frameData[16:]
 
+		// FINS/TCP 头第 12-15 字节是连接层 Error Code（与 FINS end code 不是一套）：
+		// 非 0 时说明连接/节点层就失败了，直接作为错误投递给等待方——否则调用方会一直
+		// 等到响应超时，看不出"连接数占满/节点地址冲突"这类真原因。
+		if code := binary.BigEndian.Uint32(frameData[12:16]); code != 0 {
+			t.deliverError(frameData[16:], TCPError{Code: code, Stage: "data"})
+			continue
+		}
+
+		rawFINS := frameData[16:]
 		resp, err := DecodeResponse(rawFINS)
 		if err != nil {
 			log.Printf("FINS decode error: %v, data: % X", err, rawFINS)
@@ -290,12 +307,35 @@ func (t *TCPTransport) listenLoop() {
 		}
 
 		select {
-		case ch <- resp:
+		case ch <- tcpResult{resp: resp}:
 		default:
 			log.Printf("FINS: response channel full for SID %d", resp.Header.SID)
 		}
 		if err := scanner.Err(); err != nil {
 			log.Printf("FINS scanner error: %v", err)
+		}
+	}
+}
+
+// deliverError 把连接层错误投给等待方：先按 FINS 头里的 SID 精确匹配，
+// 帧太短/ SID 不认识时投给所有等待方（宁可让每个调用方立刻拿到错误，也不要各自超时）。
+func (t *TCPTransport) deliverError(finsFrame []byte, err error) {
+	t.respMu.Lock()
+	defer t.respMu.Unlock()
+
+	if len(finsFrame) >= 10 {
+		if ch, ok := t.resp[finsFrame[9]]; ok {
+			select {
+			case ch <- tcpResult{err: err}:
+			default:
+			}
+			return
+		}
+	}
+	for _, ch := range t.resp {
+		select {
+		case ch <- tcpResult{err: err}:
+		default:
 		}
 	}
 }
