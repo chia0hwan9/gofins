@@ -4,10 +4,33 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+// ---------- end code 表 ----------
+
+// 完整表（W342-E1-15）：旧实现只覆盖约三分之一，其余回 "Unknown end code" 且不留码值。
+func TestEndCodeToStringFullTable(t *testing.T) {
+	if len(endCodeText) < 80 {
+		t.Errorf("end code 表只有 %d 条，期望覆盖 W342 全表（85 条）", len(endCodeText))
+	}
+	if got := EndCodeToString(EndCodeNormal); got != "normal completion" {
+		t.Errorf("0x0000 → %q", got)
+	}
+	// 旧实现漏掉的码（读到即报 "Unknown end code"）
+	for _, code := range []uint16{0x2003, 0x2007, 0x2103, 0x2105, 0x2605} {
+		if got := EndCodeToString(code); strings.Contains(got, "Unknown") {
+			t.Errorf("0x%04X 应能翻译，实际 %q", code, got)
+		}
+	}
+	// 未知码至少带上码值
+	if got := EndCodeToString(0xFFFF); !strings.Contains(got, "0xFFFF") {
+		t.Errorf("未知码应带 16 进制，实际 %q", got)
+	}
+}
 
 // ---------- 并发安全 ----------
 

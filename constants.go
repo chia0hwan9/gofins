@@ -150,59 +150,8 @@ const (
 	DefaultGCT byte = 0x02 // Gateway count (2 = direct connection)
 )
 
-// EndCodeToString returns a human-readable description of the end code.
-func EndCodeToString(code uint16) string {
-	switch code {
-	case EndCodeNormal:
-		return "Normal completion"
-	case EndCodeServiceInterrupted:
-		return "Service interrupted"
-	case EndCodeLocalNodeNotInNet:
-		return "Local node not in network"
-	case EndCodeTokenTimeout:
-		return "Token timeout"
-	case EndCodeRetriesFailed:
-		return "Retries failed"
-	case EndCodeDestNotInNetwork:
-		return "Destination not in network"
-	case EndCodeUnitMissing:
-		return "Unit missing"
-	case EndCodeDestBusy:
-		return "Destination busy"
-	case EndCodeResponseTimeout:
-		return "Response timeout"
-	case EndCodeUndefinedCommand:
-		return "Undefined command"
-	case EndCodeNotSupported:
-		return "Not supported by model/version"
-	case EndCodeCommandTooLong:
-		return "Command too long"
-	case EndCodeCommandTooShort:
-		return "Command too short"
-	case EndCodeHeaderError:
-		return "Header error"
-	case EndCodeAddressRangeError:
-		return "Address range error"
-	case EndCodeAddressExceeded:
-		return "Address range exceeded"
-	case EndCodeParameterError:
-		return "Parameter error"
-	case EndCodeReadProtected:
-		return "Read protected"
-	case EndCodeWriteProtected:
-		return "Write protected"
-	case EndCodeWriteReadOnly:
-		return "Write not possible: read only"
-	case EndCodeNotExecDuringExec:
-		return "Not executable during execution"
-	case EndCodeNoAccessRight:
-		return "No access right"
-	case EndCodeServiceAborted:
-		return "Service aborted"
-	default:
-		return "Unknown end code"
-	}
-}
+// 说明：完整的 end code → 文本表在 endcodes.go（EndCodeToString 由那里提供，
+// 覆盖 W342-E1-15 全部 85 个码，未知码也带上 16 进制）。
 
 // MemoryAreaToString returns a human-readable name for the memory area.
 func MemoryAreaToString(area MemoryArea) string {

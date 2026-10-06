@@ -180,6 +180,23 @@ func (s *Server) setWord(area MemoryArea, addr uint16, value uint16) {
 	s.memory[area][addr] = buf
 }
 
+// getBit/setBit 位区也存成字（与 word 区共用 memory），位号 0 = 字的 LSB。
+// 读写时按 (word, bit) 折算，跨字自动进位（bit 14 起写 4 位会落到下一字的 bit 0-1）。
+func (s *Server) getBit(area MemoryArea, word uint16, bit byte) bool {
+	v, _ := s.getWord(area, word)
+	return v&(1<<bit) != 0
+}
+
+func (s *Server) setBit(area MemoryArea, word uint16, bit byte, on bool) {
+	v, _ := s.getWord(area, word)
+	if on {
+		v |= 1 << bit
+	} else {
+		v &^= 1 << bit
+	}
+	s.setWord(area, word, v)
+}
+
 // ---------- Command handlers ----------
 
 func (s *Server) handleMemoryRead(req Request) ([]byte, error) {
@@ -189,8 +206,23 @@ func (s *Server) handleMemoryRead(req Request) ([]byte, error) {
 	}
 	area := MemoryArea(req.Data[0])
 	address := binary.BigEndian.Uint16(req.Data[1:3])
-	// req.Data[3] = bit offset (ignored for word read)
+	bitOffset := req.Data[3]
 	count := binary.BigEndian.Uint16(req.Data[4:6])
+
+	// 位区：响应是"1 位 1 字节"
+	if IsBitArea(area) {
+		data := make([]byte, count)
+		for i := uint16(0); i < count; i++ {
+			word, bit, ok := bitAt(address, bitOffset, i)
+			if !ok {
+				break
+			}
+			if s.getBit(area, word, bit) {
+				data[i] = 0x01
+			}
+		}
+		return data, nil
+	}
 
 	data := make([]byte, count*2)
 	for i := uint16(0); i < count; i++ {
@@ -203,6 +235,16 @@ func (s *Server) handleMemoryRead(req Request) ([]byte, error) {
 	return data, nil
 }
 
+// bitAt 把「起始字 + 起始位 + 第 i 位」折算成 (字地址, 位号)，越界返回 ok=false。
+func bitAt(address uint16, startBit byte, i uint16) (uint16, byte, bool) {
+	total := uint32(startBit) + uint32(i)
+	word := uint32(address) + total/16
+	if word > 0xFFFF {
+		return 0, 0, false
+	}
+	return uint16(word), byte(total % 16), true
+}
+
 func (s *Server) handleMemoryWrite(req Request) ([]byte, error) {
 	// Data format: area(1) + address(2) + bitOffset(1) + itemCount(2) + writeData
 	if len(req.Data) < 6 {
@@ -210,14 +252,30 @@ func (s *Server) handleMemoryWrite(req Request) ([]byte, error) {
 	}
 	area := MemoryArea(req.Data[0])
 	address := binary.BigEndian.Uint16(req.Data[1:3])
-	// req.Data[3] = bit offset (ignored for word write)
-	// count := binary.BigEndian.Uint16(req.Data[4:6])
-	data := req.Data[6:]
-	if len(data)%2 != 0 {
+	bitOffset := req.Data[3]
+	count := binary.BigEndian.Uint16(req.Data[4:6])
+	payload := req.Data[6:]
+
+	// 位区：数据是"1 位 1 字节"，itemCount 是位数
+	if IsBitArea(area) {
+		if len(payload) < int(count) {
+			return nil, ProtocolError{Msg: "bit write data shorter than item count"}
+		}
+		for i := uint16(0); i < count; i++ {
+			word, bit, ok := bitAt(address, bitOffset, i)
+			if !ok {
+				break
+			}
+			s.setBit(area, word, bit, payload[i]&0x01 != 0)
+		}
+		return nil, nil
+	}
+
+	if len(payload)%2 != 0 {
 		return nil, ProtocolError{Msg: "write data not word-aligned"}
 	}
-	for i := 0; i < len(data); i += 2 {
-		val := binary.BigEndian.Uint16(data[i:])
+	for i := 0; i < len(payload); i += 2 {
+		val := binary.BigEndian.Uint16(payload[i:])
 		s.setWord(area, address+uint16(i/2), val)
 	}
 	return nil, nil

@@ -234,9 +234,9 @@ words, _ := client.ReadWords(gofins.MemAreaDM, 100, 1)
 fmt.Printf("Read back: 0x%04X\n", words[0]) // 0xABCD
 ```
 
-> The simulator models **word memory only** (DM/CIO/WR/HR/AR + clock + status). Bit areas are not
-> emulated yet, so `ReadBits`/`WriteBits` cannot be exercised against it — verify bit access on
-> real hardware (or a FINS-capable SCADA/PLC emulator).
+> The simulator models **word and bit** areas (DM/CIO/WR/HR/AR word + bit codes, clock, status),
+> so `ReadBits`/`WriteBits`/`SetBit` can be exercised against it: bit 0 is the LSB of the word, and
+> accesses crossing a word boundary carry into the next word.
 
 ### Custom Command Handlers
 
