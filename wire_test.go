@@ -41,9 +41,14 @@ func newCaptureClient() (*Client, *captureTransport) {
 
 func goldenHeader() Header { return NewCommandHeader(1, 0, 2, 0, 3) }
 
+// goldenRequest 用固定 FINS 头 + 命令/数据段拼请求，便于断言完整帧。
+func goldenRequest(command uint16, data []byte) Request {
+	return Request{Header: goldenHeader(), Command: command, Data: data}
+}
+
 func TestWireFormatWordRead(t *testing.T) {
-	req := readCommand(goldenHeader(), NewWordAddress(MemAreaDM, 100), 10)
-	frame := EncodeRequest(req)
+	command, data := readCommand(NewWordAddress(MemAreaDM, 100), 10)
+	frame := EncodeRequest(goldenRequest(command, data))
 
 	wantFrame := []byte{
 		0x80, 0x00, 0x02, 0x00, 0x01, 0x00, 0x00, 0x02, 0x00, 0x03, // FINS header
@@ -59,8 +64,8 @@ func TestWireFormatWordRead(t *testing.T) {
 }
 
 func TestWireFormatWordWrite(t *testing.T) {
-	req := writeCommand(goldenHeader(), NewWordAddress(MemAreaDM, 100), WordsToBytes([]uint16{0x1234}))
-	frame := EncodeRequest(req)
+	command, data := writeCommand(NewWordAddress(MemAreaDM, 100), WordsToBytes([]uint16{0x1234}))
+	frame := EncodeRequest(goldenRequest(command, data))
 
 	wantData := []byte{0x82, 0x00, 0x64, 0x00, 0x00, 0x01, 0x12, 0x34}
 	if got := frame[12:]; !bytes.Equal(got, wantData) {
@@ -71,8 +76,8 @@ func TestWireFormatWordWrite(t *testing.T) {
 // 位读写与字读写共用 0101/0102，itemCount 固定 2 字节：
 // 之前写成 1 字节会让真实 PLC 判为命令过短，自带模拟器也会回 0x0401。
 func TestWireFormatBitRead(t *testing.T) {
-	req := readBitsCommand(goldenHeader(), MemAreaCIOBit, 0, 0, 8)
-	frame := EncodeRequest(req)
+	command, data := readBitsCommand(MemAreaCIOBit, 0, 0, 8)
+	frame := EncodeRequest(goldenRequest(command, data))
 
 	wantData := []byte{
 		0x30,       // CIO (bit)
@@ -88,8 +93,8 @@ func TestWireFormatBitRead(t *testing.T) {
 // 位写：itemCount 是位数，位数据「1 位 1 字节」。
 // 传 len(bytes)*8 会让 PLC 多写后面几位（SetBit 连带清掉同字里后续 7 位）。
 func TestWireFormatBitWrite(t *testing.T) {
-	req := writeBitsCommand(goldenHeader(), MemAreaHRBit, 100, 3, 1, []byte{0x01})
-	frame := EncodeRequest(req)
+	command, data := writeBitsCommand(MemAreaHRBit, 100, 3, 1, []byte{0x01})
+	frame := EncodeRequest(goldenRequest(command, data))
 
 	wantData := []byte{
 		0x32,       // HR (bit)
@@ -152,7 +157,8 @@ func TestWireFormatBitWrite256(t *testing.T) {
 // Length 字段 = 从第 8 字节到帧尾（规范定义），数据帧 = 8 + len(FINS 帧)。
 // 旧实现只写 len(FINS 帧)，比规范少 8，真实 PLC 会按错误长度切帧。
 func TestFINSTCPFrameLength(t *testing.T) {
-	finsFrame := EncodeRequest(statusReadCommand(goldenHeader())) // 10 + 2 = 12 字节
+	command, cmdData := statusReadCommand()
+	finsFrame := EncodeRequest(goldenRequest(command, cmdData)) // 10 + 2 = 12 字节
 	payload := make([]byte, 8+len(finsFrame))
 	binary.BigEndian.PutUint32(payload[0:4], finsCmdData)
 	copy(payload[8:], finsFrame)
@@ -181,9 +187,11 @@ func TestFINSTCPFrameLength(t *testing.T) {
 
 // 发送方的 Length 与 finsSplitFunc 的切帧必须一致，且能一次切出整帧。
 func TestFINSTCPFrameRoundTrip(t *testing.T) {
-	payload := make([]byte, 8+len(EncodeRequest(statusReadCommand(goldenHeader()))))
+	command, cmdData := statusReadCommand()
+	inner := EncodeRequest(goldenRequest(command, cmdData))
+	payload := make([]byte, 8+len(inner))
 	binary.BigEndian.PutUint32(payload[0:4], finsCmdData)
-	copy(payload[8:], EncodeRequest(statusReadCommand(goldenHeader())))
+	copy(payload[8:], inner)
 	f1 := wrapFINSTCPFrame(payload)
 	f2 := wrapFINSTCPFrame(payload)
 

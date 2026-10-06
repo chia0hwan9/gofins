@@ -146,7 +146,8 @@ func TestHeaderEncodeDecode(t *testing.T) {
 
 func TestRequestEncodeDecode(t *testing.T) {
 	ma := NewWordAddress(MemAreaDM, 100)
-	req := readCommand(NewCommandHeader(1, 0, 2, 0, 5), ma, 2)
+	command, data := readCommand(ma, 2)
+	req := Request{Header: NewCommandHeader(1, 0, 2, 0, 5), Command: command, Data: data}
 	frame := EncodeRequest(req)
 
 	// Verify frame structure

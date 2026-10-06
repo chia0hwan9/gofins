@@ -36,6 +36,9 @@ func NewUDPTransport(addr string) (*UDPTransport, error) {
 func (t *UDPTransport) Connect() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		return ConnectionClosedError{}
+	}
 	if t.conn != nil {
 		return nil
 	}
@@ -58,6 +61,12 @@ func (t *UDPTransport) SetTimeout(d time.Duration) {
 // Send sends a raw FINS frame and waits for the response.
 func (t *UDPTransport) Send(frame []byte) ([]byte, error) {
 	t.mu.Lock()
+	// Close() 是终态：不能在 Close 之后又悄悄把 socket 建回来（否则 ListenLoop
+	// 会多起一份，且调用方以为已经断开了）。
+	if t.closed {
+		t.mu.Unlock()
+		return nil, ConnectionClosedError{}
+	}
 	if t.conn == nil {
 		t.mu.Unlock()
 		if err := t.Connect(); err != nil {

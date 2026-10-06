@@ -16,6 +16,7 @@ Merged and refined from [folke99/gofins](https://github.com/folke99/gofins) (TCP
 - **BCD encoding**: built-in BCD encode/decode for clock and numeric values
 - **PLC control**: Run, Stop, Clock read/write, Status
 - **Keepalive**: optional periodic status polling on TCP connections
+- **Goroutine-safe**: one `Client` can be shared — request/response cycles, SID allocation and byte order are serialized internally (one command in flight at a time)
 - **Error handling**: typed errors for timeouts, end codes, protocol violations
 - **Pluggable transport**: implement `Transport` for custom transports
 
@@ -199,8 +200,15 @@ status.HasFatalError()                // true if any fatal error
 ### Byte Order
 
 ```go
-client.SetByteOrder(binary.LittleEndian) // Default: BigEndian
+client.SetByteOrder(binary.LittleEndian) // Default: BigEndian — applies to word reads AND writes
 ```
+
+### Limits
+
+One command carries at most `MaxItemsPerCommand` (999) words or `MaxBitsPerCommand` (256) bits —
+larger transfers must be split by the caller. Out-of-range counts, an empty write and `startBit > 15`
+are rejected with a `ProtocolError`/`InvalidAddressError` instead of being sent. A response that is
+shorter than requested is an error too (it is never silently zero-filled).
 
 ### Ping
 
@@ -225,6 +233,10 @@ client.WriteWords(gofins.MemAreaDM, 100, []uint16{0xABCD})
 words, _ := client.ReadWords(gofins.MemAreaDM, 100, 1)
 fmt.Printf("Read back: 0x%04X\n", words[0]) // 0xABCD
 ```
+
+> The simulator models **word memory only** (DM/CIO/WR/HR/AR + clock + status). Bit areas are not
+> emulated yet, so `ReadBits`/`WriteBits` cannot be exercised against it — verify bit access on
+> real hardware (or a FINS-capable SCADA/PLC emulator).
 
 ### Custom Command Handlers
 

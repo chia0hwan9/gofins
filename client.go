@@ -3,11 +3,25 @@ package gofins
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
+	"sync"
 	"time"
 )
 
+// FINS 单命令上限：超过必须由调用方拆包（否则响应帧会超出传输的分帧缓冲，
+// TCP 侧 scanner 一旦超限整条连接作废）。
+const (
+	MaxItemsPerCommand = 999 // 0101/0102 字（项）上限
+	MaxBitsPerCommand  = 256 // 位读写上限
+)
+
 // Client is the high-level FINS client, transport-agnostic.
+//
+// 并发安全：同一个 Client 可被多个 goroutine 共用——请求/响应周期（一问一答）、
+// SID 分配与字节序读写都在内部串行化（与 gomc 的处理一致）。代价是同一时刻只有
+// 一个命令在途：若某次调用等到响应超时，其它调用会排队。
 type Client struct {
+	mu        sync.Mutex
 	transport Transport
 	srcNode   byte
 	srcUnit   byte
@@ -40,28 +54,38 @@ func (c *Client) SetTimeout(d time.Duration) {
 }
 
 // SetByteOrder sets the byte order for word read/write operations. Default: BigEndian.
+// 读写双向都生效（读解码与写编码用同一个设置）。
 func (c *Client) SetByteOrder(order binary.ByteOrder) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.byteOrder = order
 }
 
 // Close closes the underlying transport.
+// 不等待在途命令；在途命令会以传输层错误返回。
 func (c *Client) Close() error {
 	return c.transport.Close()
 }
 
-// nextHeader creates a command header with an incremented SID.
-func (c *Client) nextHeader() Header {
-	c.sid++
-	if c.sid == 0 {
-		c.sid = 1
-	}
-	return NewCommandHeader(c.dstNode, c.dstUnit, c.srcNode, c.srcUnit, c.sid)
+// order 取当前字节序快照（一次操作内保持一致，不必持锁做 I/O）。
+func (c *Client) order() binary.ByteOrder {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.byteOrder
 }
 
-// sendRequest encodes, sends, and decodes a FINS request/response cycle.
-func (c *Client) sendRequest(req Request) (Response, error) {
-	frame := EncodeRequest(req)
-	respBytes, err := c.transport.Send(frame)
+// do 编码、发送并解码一条命令（锁内完成 SID 分配与一问一答）。
+// end code 非 0 时返回 EndCodeError（响应同时返回，便于调用方取现场）。
+func (c *Client) do(command uint16, data []byte) (Response, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.sid++
+	if c.sid == 0 {
+		c.sid = 1 // SID 0 保留给握手
+	}
+	header := NewCommandHeader(c.dstNode, c.dstUnit, c.srcNode, c.srcUnit, c.sid)
+	respBytes, err := c.transport.Send(EncodeRequest(Request{Header: header, Command: command, Data: data}))
 	if err != nil {
 		return Response{}, err
 	}
@@ -75,6 +99,15 @@ func (c *Client) sendRequest(req Request) (Response, error) {
 	return resp, nil
 }
 
+// encodeWords 按给定字节序编码字（写路径也要遵守 SetByteOrder）。
+func encodeWords(values []uint16, order binary.ByteOrder) []byte {
+	b := make([]byte, len(values)*2)
+	for i, v := range values {
+		order.PutUint16(b[i*2:], v)
+	}
+	return b
+}
+
 // ---------- Word Read/Write ----------
 
 // ReadWords reads count words from the specified memory area starting at address.
@@ -82,15 +115,21 @@ func (c *Client) ReadWords(area MemoryArea, address uint16, count uint16) ([]uin
 	if !IsWordArea(area) {
 		return nil, IncompatibleMemoryAreaError{Area: area}
 	}
-	ma := NewWordAddress(area, address)
-	req := readCommand(c.nextHeader(), ma, count)
-	resp, err := c.sendRequest(req)
+	if count == 0 || count > MaxItemsPerCommand {
+		return nil, ProtocolError{Msg: fmt.Sprintf("word count %d out of range 1..%d", count, MaxItemsPerCommand)}
+	}
+	order := c.order()
+	command, data := readCommand(NewWordAddress(area, address), count)
+	resp, err := c.do(command, data)
 	if err != nil {
 		return nil, err
 	}
+	if len(resp.Data) < int(count)*2 {
+		return nil, ProtocolError{Msg: fmt.Sprintf("short read response: got %d bytes, want %d words", len(resp.Data), count)}
+	}
 	words := make([]uint16, count)
-	for i := uint16(0); i < count && i*2+1 < uint16(len(resp.Data)); i++ {
-		words[i] = c.byteOrder.Uint16(resp.Data[i*2 : i*2+2])
+	for i := range words {
+		words[i] = order.Uint16(resp.Data[i*2:])
 	}
 	return words, nil
 }
@@ -100,44 +139,57 @@ func (c *Client) WriteWords(area MemoryArea, address uint16, values []uint16) er
 	if !IsWordArea(area) {
 		return IncompatibleMemoryAreaError{Area: area}
 	}
-	data := WordsToBytes(values)
-	ma := NewWordAddress(area, address)
-	req := writeCommand(c.nextHeader(), ma, data)
-	_, err := c.sendRequest(req)
+	if len(values) == 0 || len(values) > MaxItemsPerCommand {
+		return ProtocolError{Msg: fmt.Sprintf("word count %d out of range 1..%d", len(values), MaxItemsPerCommand)}
+	}
+	command, data := writeCommand(NewWordAddress(area, address), encodeWords(values, c.order()))
+	_, err := c.do(command, data)
 	return err
 }
 
 // ---------- Byte Read/Write ----------
 
-// ReadBytes reads raw bytes from a word memory area (must be even count).
+// ReadBytes reads raw bytes from a word memory area (byte count must be even).
 func (c *Client) ReadBytes(area MemoryArea, address uint16, countBytes uint16) ([]byte, error) {
-	if countBytes%2 != 0 {
-		return nil, ProtocolError{Msg: "byte count must be even for word-based memory"}
+	if countBytes == 0 || countBytes%2 != 0 {
+		return nil, ProtocolError{Msg: "byte count must be non-zero and even for word-based memory"}
 	}
 	if !IsWordArea(area) {
 		return nil, IncompatibleMemoryAreaError{Area: area}
 	}
-	ma := NewWordAddress(area, address)
-	req := readCommand(c.nextHeader(), ma, countBytes/2)
-	resp, err := c.sendRequest(req)
+	if countBytes/2 > MaxItemsPerCommand {
+		return nil, ProtocolError{Msg: fmt.Sprintf("byte count %d out of range 2..%d", countBytes, MaxItemsPerCommand*2)}
+	}
+	command, data := readCommand(NewWordAddress(area, address), countBytes/2)
+	resp, err := c.do(command, data)
 	if err != nil {
 		return nil, err
 	}
-	return resp.Data, nil
+	if len(resp.Data) < int(countBytes) {
+		return nil, ProtocolError{Msg: fmt.Sprintf("short read response: got %d bytes, want %d", len(resp.Data), countBytes)}
+	}
+	out := make([]byte, countBytes)
+	copy(out, resp.Data) // 给调用方独立切片，不与响应缓冲共享
+	return out, nil
 }
 
 // WriteBytes writes raw bytes to a word memory area (must be even length).
 func (c *Client) WriteBytes(area MemoryArea, address uint16, data []byte) error {
-	if len(data)%2 != 0 {
-		return ProtocolError{Msg: "data length must be even for word-based memory"}
+	if len(data) == 0 || len(data)%2 != 0 {
+		return ProtocolError{Msg: "data length must be non-zero and even for word-based memory"}
 	}
-	return c.WriteWords(area, address, bytesToWordsRaw(data, c.byteOrder))
+	order := c.order()
+	values := make([]uint16, len(data)/2)
+	for i := range values {
+		values[i] = order.Uint16(data[i*2:])
+	}
+	return c.WriteWords(area, address, values)
 }
 
 // ---------- String Read/Write ----------
 
 // ReadString reads a string from PLC memory.
-// byteCount is the number of BYTES to read (must be even for word areas).
+// byteCount is the number of BYTES to read (odd values are rounded up for word alignment).
 // Returns the string with trailing null bytes trimmed.
 func (c *Client) ReadString(area MemoryArea, address uint16, byteCount uint16) (string, error) {
 	if byteCount%2 != 0 {
@@ -163,20 +215,27 @@ func (c *Client) WriteString(area MemoryArea, address uint16, s string) error {
 // ---------- Bit Read/Write ----------
 
 // ReadBits reads count bits starting at the given address and bit offset.
+// 响应里的位数据是"1 位 1 字节"。
 func (c *Client) ReadBits(area MemoryArea, address uint16, startBit byte, count uint16) ([]bool, error) {
 	if !IsBitArea(area) {
 		return nil, IncompatibleMemoryAreaError{Area: area}
 	}
-	if count > 256 {
-		return nil, ProtocolError{Msg: "bit count cannot exceed 256"}
+	if startBit > 15 {
+		return nil, InvalidAddressError{Area: area, Address: address}
 	}
-	req := readBitsCommand(c.nextHeader(), area, address, startBit, count)
-	resp, err := c.sendRequest(req)
+	if count == 0 || count > MaxBitsPerCommand {
+		return nil, ProtocolError{Msg: fmt.Sprintf("bit count %d out of range 1..%d", count, MaxBitsPerCommand)}
+	}
+	command, data := readBitsCommand(area, address, startBit, count)
+	resp, err := c.do(command, data)
 	if err != nil {
 		return nil, err
 	}
+	if len(resp.Data) < int(count) {
+		return nil, ProtocolError{Msg: fmt.Sprintf("short bit read response: got %d bytes, want %d", len(resp.Data), count)}
+	}
 	bits := make([]bool, count)
-	for i := uint16(0); i < count && i < uint16(len(resp.Data)); i++ {
+	for i := range bits {
 		bits[i] = resp.Data[i]&0x01 != 0
 	}
 	return bits, nil
@@ -188,8 +247,11 @@ func (c *Client) WriteBits(area MemoryArea, address uint16, startBit byte, value
 	if !IsBitArea(area) {
 		return IncompatibleMemoryAreaError{Area: area}
 	}
-	if len(values) > 256 {
-		return ProtocolError{Msg: "bit count cannot exceed 256"}
+	if startBit > 15 {
+		return InvalidAddressError{Area: area, Address: address}
+	}
+	if len(values) == 0 || len(values) > MaxBitsPerCommand {
+		return ProtocolError{Msg: fmt.Sprintf("bit count %d out of range 1..%d", len(values), MaxBitsPerCommand)}
 	}
 	bitsData := make([]byte, len(values))
 	for i, v := range values {
@@ -197,8 +259,8 @@ func (c *Client) WriteBits(area MemoryArea, address uint16, startBit byte, value
 			bitsData[i] = 0x01
 		}
 	}
-	req := writeBitsCommand(c.nextHeader(), area, address, startBit, uint16(len(values)), bitsData)
-	_, err := c.sendRequest(req)
+	command, data := writeBitsCommand(area, address, startBit, uint16(len(values)), bitsData)
+	_, err := c.do(command, data)
 	return err
 }
 
@@ -218,9 +280,6 @@ func (c *Client) ToggleBit(area MemoryArea, address uint16, bit byte) error {
 	if err != nil {
 		return err
 	}
-	if len(bits) == 0 {
-		return ProtocolError{Msg: "failed to read bit"}
-	}
 	return c.WriteBits(area, address, bit, []bool{!bits[0]})
 }
 
@@ -228,33 +287,36 @@ func (c *Client) ToggleBit(area MemoryArea, address uint16, bit byte) error {
 
 // ReadClock reads the PLC's internal clock.
 func (c *Client) ReadClock() (*time.Time, error) {
-	req := clockReadCommand(c.nextHeader())
-	resp, err := c.sendRequest(req)
+	command, data := clockReadCommand()
+	resp, err := c.do(command, data)
 	if err != nil {
 		return nil, err
 	}
 	if len(resp.Data) < 7 {
 		return nil, ProtocolError{Msg: "clock response too short"}
 	}
-	year, _ := BCDDecodeByte(resp.Data[0])
-	month, _ := BCDDecodeByte(resp.Data[1])
-	day, _ := BCDDecodeByte(resp.Data[2])
-	hour, _ := BCDDecodeByte(resp.Data[3])
-	min, _ := BCDDecodeByte(resp.Data[4])
-	sec, _ := BCDDecodeByte(resp.Data[5])
-	// Year is two-digit: < 50 → 2000+, >= 50 → 1900+
-	fullYear := int(year) + 2000
-	if year >= 50 {
-		fullYear = int(year) + 1900
+	fields := make([]int, 6)
+	for i := range fields {
+		v, err := BCDDecodeByte(resp.Data[i])
+		if err != nil {
+			return nil, fmt.Errorf("clock field %d: %w", i, err)
+		}
+		fields[i] = int(v)
 	}
-	t := time.Date(fullYear, time.Month(month), int(day), int(hour), int(min), int(sec), 0, time.Local)
+	year, month, day, hour, min, sec := fields[0], fields[1], fields[2], fields[3], fields[4], fields[5]
+	// Year is two-digit: < 50 → 2000+, >= 50 → 1900+
+	fullYear := year + 2000
+	if year >= 50 {
+		fullYear = year + 1900
+	}
+	t := time.Date(fullYear, time.Month(month), day, hour, min, sec, 0, time.Local)
 	return &t, nil
 }
 
 // WriteClock sets the PLC's clock.
 func (c *Client) WriteClock(t time.Time) error {
-	req := clockWriteCommand(c.nextHeader(), t)
-	_, err := c.sendRequest(req)
+	command, data := clockWriteCommand(t)
+	_, err := c.do(command, data)
 	return err
 }
 
@@ -262,15 +324,15 @@ func (c *Client) WriteClock(t time.Time) error {
 
 // Run requests the PLC to enter RUN mode.
 func (c *Client) Run() error {
-	req := runCommand(c.nextHeader(), 0x00) // 0x00 = RUN
-	_, err := c.sendRequest(req)
+	command, data := runCommand(0x00) // 0x00 = RUN
+	_, err := c.do(command, data)
 	return err
 }
 
 // Stop requests the PLC to enter PROGRAM (stop) mode.
 func (c *Client) Stop() error {
-	req := stopCommand(c.nextHeader())
-	_, err := c.sendRequest(req)
+	command, data := stopCommand()
+	_, err := c.do(command, data)
 	return err
 }
 
@@ -286,8 +348,8 @@ type PLCStatus struct {
 
 // Status reads the PLC operating status.
 func (c *Client) Status() (*PLCStatus, error) {
-	req := statusReadCommand(c.nextHeader())
-	resp, err := c.sendRequest(req)
+	command, data := statusReadCommand()
+	resp, err := c.do(command, data)
 	if err != nil {
 		return nil, err
 	}
@@ -327,15 +389,4 @@ func (s *PLCStatus) HasFatalError() bool { return s.FatalError != 0 }
 func (c *Client) Ping() error {
 	_, err := c.Status()
 	return err
-}
-
-// ---------- Helpers ----------
-
-// bytesToWordsRaw converts bytes to uint16 slice using the given byte order.
-func bytesToWordsRaw(data []byte, order binary.ByteOrder) []uint16 {
-	words := make([]uint16, len(data)/2)
-	for i := 0; i < len(data); i += 2 {
-		words[i/2] = order.Uint16(data[i : i+2])
-	}
-	return words
 }

@@ -17,7 +17,10 @@ const (
 	finsCmdHandshakeRsp uint32 = 1 // Handshake response
 	finsCmdData         uint32 = 2 // Data frame
 
-	maxFrameLength = 2048
+	// 分帧缓冲上限：合法 FINS/TCP 帧最大 = 16(头) + 10(FINS 头) + 2(命令) + 2(end code)
+	// + 999×2(项上限) = 2044。留一倍余量：bufio.Scanner 一旦返回 ErrTooLong 就永久停止，
+	// 整条传输作废——不能因为一次坏长度就无声死掉。
+	maxFrameLength = 4096
 
 	defaultConnectTimeout  = 5 * time.Second
 	defaultResponseTimeout = 10 * time.Second
@@ -343,11 +346,10 @@ func (t *TCPTransport) startKeepaliveLocked() {
 		for {
 			select {
 			case <-ticker.C:
-				// Send status read as keepalive
+				// Send status read as keepalive（SID 由 Send 用传输自己的计数器覆盖）
+				command, data := statusReadCommand()
 				header := NewCommandHeader(t.plcNode, 0, t.node, t.unit, 0)
-				req := statusReadCommand(header)
-				frame := EncodeRequest(req)
-				t.Send(frame) // Ignore errors
+				t.Send(EncodeRequest(Request{Header: header, Command: command, Data: data})) // Ignore errors
 			case <-t.stopKeep:
 				return
 			}
