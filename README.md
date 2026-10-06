@@ -95,9 +95,13 @@ words, err := client.ReadWords(gofins.MemAreaDM, 100, 10)
 t := gofins.NewTCPTransport("192.168.1.100:9600", 1, 0, 0)
 t.SetTimeout(5 * time.Second)         // Response timeout (default: 10s)
 t.SetKeepalive(30 * time.Second)      // Periodic status polling
-t.SetReconnect(true)                  // Auto-reconnect on failure (default: true)
 t.Connect()                           // Establishes TCP + FINS handshake
 ```
+
+> **Reconnect is the caller's job.** The transports do not reconnect on their own: after a
+> failure `Send` returns `NotConnectedError` until you `Close()` the transport and build a new
+> one. This matches the gateway-side design of the projects this library is used from, where one
+> reconnect scheduler owns every channel (backoff, de-duplication, logging in one place).
 
 ### UDP Options
 
@@ -166,6 +170,10 @@ client.SetBit(MemAreaHRBit, address, bit)
 client.ResetBit(MemAreaHRBit, address, bit)
 client.ToggleBit(MemAreaHRBit, address, bit)
 ```
+
+Bit commands reuse the word read/write commands (`0101`/`0102`) with a bit-area code, a bit
+number and a **bit count**: the item count is the number of *bits*, and bit data is one byte per
+bit (`0x00`/`0x01`) — on the wire and in the response. Don't pass a byte count.
 
 ### PLC Clock
 

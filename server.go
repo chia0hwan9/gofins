@@ -75,7 +75,11 @@ func (s *Server) ListenAndServe(addr string) error {
 			}
 			return err
 		}
-		go s.handleRequest(buf[:n], remoteAddr)
+		// 拷贝出本次请求再交给 goroutine：读循环马上会复用 buf，
+		// 直接传 buf[:n] 会与 handleRequest 里解析的请求互相覆盖（并发下必须 copy）。
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+		go s.handleRequest(pkt, remoteAddr)
 	}
 }
 

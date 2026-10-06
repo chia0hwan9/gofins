@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"sync"
@@ -16,21 +17,34 @@ const (
 	finsCmdHandshakeRsp uint32 = 1 // Handshake response
 	finsCmdData         uint32 = 2 // Data frame
 
-	minFrameLength = 16 // Minimum FINS TCP frame (header alone)
 	maxFrameLength = 2048
 
 	defaultConnectTimeout  = 5 * time.Second
 	defaultResponseTimeout = 10 * time.Second
 )
 
+// wrapFINSTCPFrame 给 payload 加 FINS/TCP 头。payload 是第 8 字节之后的部分：
+// 命令(4) + 错误码(4) + [FINS 帧]。
+//
+// Length 字段 = len(payload)（规范定义：从第 8 字节到帧尾的字节数）。
+// 握手帧 payload 12 字节 → Length=12（帧总长 20）；数据帧 payload 8+len(FINS) → Length=8+len(FINS)。
+// 这个字段写错（例如只写 FINS 帧长度）时 PLC 会按错误长度切帧，TCP 链路直接不通。
+func wrapFINSTCPFrame(payload []byte) []byte {
+	frame := make([]byte, 8+len(payload))
+	copy(frame[0:4], finsMagic)
+	binary.BigEndian.PutUint32(frame[4:8], uint32(len(payload)))
+	copy(frame[8:], payload)
+	return frame
+}
+
 // TCPTransport implements FINS over TCP with FINS init frame wrapping,
-// persistent connection, handshake, SID management, and optional reconnect.
+// persistent connection, handshake and SID management.
+// 断线重连由调用方负责（与项目内其它连接器库一致：网关自己管退避重试）。
 type TCPTransport struct {
 	addr              string
 	node, unit, netw  byte // Source FINS address
 	plcNode           byte // PLC node (learned from handshake)
 	timeout           time.Duration
-	reconnect         bool
 	keepaliveInterval time.Duration
 
 	conn     net.Conn
@@ -48,13 +62,12 @@ type TCPTransport struct {
 // addr: "host:port", srcNode/srcUnit: source FINS address.
 func NewTCPTransport(addr string, srcNode, srcUnit, srcNetwork byte) *TCPTransport {
 	return &TCPTransport{
-		addr:      addr,
-		node:      srcNode,
-		unit:      srcUnit,
-		netw:      srcNetwork,
-		timeout:   defaultResponseTimeout,
-		reconnect: true,
-		resp:      make(map[byte]chan Response),
+		addr:    addr,
+		node:    srcNode,
+		unit:    srcUnit,
+		netw:    srcNetwork,
+		timeout: defaultResponseTimeout,
+		resp:    make(map[byte]chan Response),
 	}
 }
 
@@ -63,13 +76,6 @@ func (t *TCPTransport) SetTimeout(d time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.timeout = d
-}
-
-// SetReconnect enables or disables automatic reconnect.
-func (t *TCPTransport) SetReconnect(enable bool) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.reconnect = enable
 }
 
 // SetKeepalive sets the keepalive interval (0 to disable).
@@ -122,26 +128,34 @@ func (t *TCPTransport) Connect() error {
 // handshakeLocked performs the FINS TCP connection handshake.
 // Must be called with t.mu held.
 func (t *TCPTransport) handshakeLocked() error {
-	// Build handshake frame: FINS init header (16 bytes) + clientNode (4 bytes) = 20 bytes
-	frame := make([]byte, 20)
-	copy(frame[0:4], finsMagic)
-	binary.BigEndian.PutUint32(frame[4:8], 12)                // Length = 12 (init frame is 8 + 4 for clientNode)
-	binary.BigEndian.PutUint32(frame[8:12], finsCmdHandshake) // Command = 0
-	binary.BigEndian.PutUint32(frame[12:16], 0)               // Error code = 0
-	// clientNode bytes 16-19 are already zero (auto-assign)
+	// Handshake frame: FINS/TCP header + 4-byte client node address (0 = auto-assign)
+	payload := make([]byte, 12)
+	binary.BigEndian.PutUint32(payload[0:4], finsCmdHandshake) // Command = 0
+	binary.BigEndian.PutUint32(payload[4:8], 0)                // Error code = 0
+	// payload[8:12] = client node address, 0 = auto-assign
+	frame := wrapFINSTCPFrame(payload) // 20 bytes
 
 	if _, err := t.conn.Write(frame); err != nil {
 		return fmt.Errorf("handshake write: %w", err)
 	}
 
+	// Response: 24 bytes = FINS/TCP header + client node + server node。
+	// 必须 io.ReadFull：单次 Read 可能只拿到 TCP 分段的一部分，会把节点号读成 0
+	// 并把剩余字节留在缓冲里让后续分帧错位。
 	resp := make([]byte, 24)
-	if _, err := t.reader.Read(resp); err != nil {
+	if _, err := io.ReadFull(t.reader, resp); err != nil {
 		return fmt.Errorf("handshake read: %w", err)
 	}
 
 	// Verify FINS marker
 	if string(resp[0:4]) != finsMagic {
 		return ProtocolError{Msg: "invalid handshake response: missing FINS marker"}
+	}
+	if cmd := binary.BigEndian.Uint32(resp[8:12]); cmd != finsCmdHandshakeRsp {
+		return ProtocolError{Msg: fmt.Sprintf("invalid handshake response: command %d, want %d", cmd, finsCmdHandshakeRsp)}
+	}
+	if code := binary.BigEndian.Uint32(resp[12:16]); code != 0 {
+		return ProtocolError{Msg: fmt.Sprintf("handshake rejected by PLC: error code %d", code)}
 	}
 
 	// Extract assigned node numbers
@@ -175,14 +189,13 @@ func (t *TCPTransport) Send(frame []byte) ([]byte, error) {
 		frame[9] = sid
 	}
 
-	// Build TCP-wrapped frame: FINS init header (16) + raw FINS frame
-	finsLen := uint32(len(frame))
-	wrappedFrame := make([]byte, 16+len(frame))
-	copy(wrappedFrame[0:4], finsMagic)
-	binary.BigEndian.PutUint32(wrappedFrame[4:8], finsLen)
-	binary.BigEndian.PutUint32(wrappedFrame[8:12], finsCmdData)
-	binary.BigEndian.PutUint32(wrappedFrame[12:16], 0) // Error code = 0
-	copy(wrappedFrame[16:], frame)
+	// Build TCP-wrapped frame: FINS/TCP header (16) + raw FINS frame。
+	// payload = 命令(4) + 错误码(4) + FINS 帧 → Length = 8 + len(frame)。
+	payload := make([]byte, 8+len(frame))
+	binary.BigEndian.PutUint32(payload[0:4], finsCmdData)
+	binary.BigEndian.PutUint32(payload[4:8], 0) // Error code = 0
+	copy(payload[8:], frame)
+	wrappedFrame := wrapFINSTCPFrame(payload)
 
 	// Create response channel before sending
 	respCh := make(chan Response, 1)
@@ -309,7 +322,8 @@ func finsSplitFunc(data []byte, atEOF bool) (advance int, token []byte, err erro
 		return 8, nil, nil // Invalid length, skip init header
 	}
 
-	totalLen := 16 + int(msgLen) // FINS init header + FINS message
+	// Length = 从第 8 字节到帧尾，所以整帧 = 8 + Length（不是 16 + Length）
+	totalLen := 8 + int(msgLen)
 	if len(data) < totalLen {
 		return 0, nil, nil // Need more data
 	}

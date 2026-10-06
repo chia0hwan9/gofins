@@ -135,7 +135,12 @@ func (t *UDPTransport) listenLoop() {
 			continue // Too short for a FINS response
 		}
 
-		resp, err := DecodeResponse(buf[:n])
+		// 拷贝出本次数据报：resp.Data 会指向它，而下一个 datagram 会覆盖共享的 buf
+		// （等待方还在 EncodeResponse 时会读到被覆盖的内容）。
+		pkt := make([]byte, n)
+		copy(pkt, buf[:n])
+
+		resp, err := DecodeResponse(pkt)
 		if err != nil {
 			log.Printf("UDP decode error: %v", err)
 			continue

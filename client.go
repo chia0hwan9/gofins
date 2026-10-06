@@ -183,6 +183,7 @@ func (c *Client) ReadBits(area MemoryArea, address uint16, startBit byte, count 
 }
 
 // WriteBits writes bits starting at the given address and bit offset.
+// 位数据按"1 位 1 字节"（0x00/0x01）发出，命令里的 itemCount = 位数。
 func (c *Client) WriteBits(area MemoryArea, address uint16, startBit byte, values []bool) error {
 	if !IsBitArea(area) {
 		return IncompatibleMemoryAreaError{Area: area}
@@ -190,15 +191,13 @@ func (c *Client) WriteBits(area MemoryArea, address uint16, startBit byte, value
 	if len(values) > 256 {
 		return ProtocolError{Msg: "bit count cannot exceed 256"}
 	}
-	// Pack bits into bytes
-	byteLen := (len(values) + 7) / 8
-	bitsData := make([]byte, byteLen)
+	bitsData := make([]byte, len(values))
 	for i, v := range values {
 		if v {
-			bitsData[i/8] |= 1 << (i % 8)
+			bitsData[i] = 0x01
 		}
 	}
-	req := writeBitsCommand(c.nextHeader(), area, address, startBit, bitsData)
+	req := writeBitsCommand(c.nextHeader(), area, address, startBit, uint16(len(values)), bitsData)
 	_, err := c.sendRequest(req)
 	return err
 }
