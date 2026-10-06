@@ -144,6 +144,8 @@ func mapErrorToEndCode(err error) uint16 {
 	switch err.(type) {
 	case InvalidAddressError:
 		return EndCodeAddressRangeError
+	case addressExceededError:
+		return EndCodeAddressExceeded
 	default:
 		return EndCodeUndefinedCommand
 	}
@@ -199,6 +201,15 @@ func (s *Server) setBit(area MemoryArea, word uint16, bit byte, on bool) {
 
 // ---------- Command handlers ----------
 
+// simMaxWordAddress 模拟器的字地址上限（CJ/CS 系列 DM/EM 最大 D32767）。
+// 上游 l1va 的模拟器会做越界检查并回 0x1104，我们保留这条——越界路径也能端到端测。
+const simMaxWordAddress = 32767
+
+// addressExceededError 让模拟器 handler 指定 end code 0x1104（地址范围溢出）。
+type addressExceededError struct{}
+
+func (addressExceededError) Error() string { return "address range exceeded" }
+
 func (s *Server) handleMemoryRead(req Request) ([]byte, error) {
 	// Data format: area(1) + address(2) + bitOffset(1) + itemCount(2) = 6 bytes
 	if len(req.Data) < 6 {
@@ -208,9 +219,15 @@ func (s *Server) handleMemoryRead(req Request) ([]byte, error) {
 	address := binary.BigEndian.Uint16(req.Data[1:3])
 	bitOffset := req.Data[3]
 	count := binary.BigEndian.Uint16(req.Data[4:6])
+	if count == 0 {
+		return nil, ProtocolError{Msg: "read item count is zero"}
+	}
 
 	// 位区：响应是"1 位 1 字节"
 	if IsBitArea(area) {
+		if uint32(address)+(uint32(bitOffset)+uint32(count)-1)/16 > simMaxWordAddress {
+			return nil, addressExceededError{}
+		}
 		data := make([]byte, count)
 		for i := uint16(0); i < count; i++ {
 			word, bit, ok := bitAt(address, bitOffset, i)
@@ -222,6 +239,10 @@ func (s *Server) handleMemoryRead(req Request) ([]byte, error) {
 			}
 		}
 		return data, nil
+	}
+
+	if uint32(address)+uint32(count)-1 > simMaxWordAddress {
+		return nil, addressExceededError{}
 	}
 
 	data := make([]byte, count*2)
@@ -258,8 +279,11 @@ func (s *Server) handleMemoryWrite(req Request) ([]byte, error) {
 
 	// 位区：数据是"1 位 1 字节"，itemCount 是位数
 	if IsBitArea(area) {
-		if len(payload) < int(count) {
+		if count == 0 || len(payload) < int(count) {
 			return nil, ProtocolError{Msg: "bit write data shorter than item count"}
+		}
+		if uint32(address)+(uint32(bitOffset)+uint32(count)-1)/16 > simMaxWordAddress {
+			return nil, addressExceededError{}
 		}
 		for i := uint16(0); i < count; i++ {
 			word, bit, ok := bitAt(address, bitOffset, i)
@@ -273,6 +297,9 @@ func (s *Server) handleMemoryWrite(req Request) ([]byte, error) {
 
 	if len(payload)%2 != 0 {
 		return nil, ProtocolError{Msg: "write data not word-aligned"}
+	}
+	if words := uint32(len(payload) / 2); words > 0 && uint32(address)+words-1 > simMaxWordAddress {
+		return nil, addressExceededError{}
 	}
 	for i := 0; i < len(payload); i += 2 {
 		val := binary.BigEndian.Uint16(payload[i:])

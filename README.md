@@ -194,7 +194,13 @@ status, err := client.Status()        // Read operating status
 status.IsRunning()                    // true if RUN mode
 status.IsStopped()                    // true if STOP mode
 status.IsStandby()                    // true if STANDBY
-status.HasFatalError()                // true if any fatal error
+status.IsProgramMode()                // / IsDebugMode() / IsMonitorMode() / IsRunMode()
+status.StatusCode().String()          // "RUN" / "STOP" / "STANDBY"
+status.ModeCode().String()            // "PROGRAM" / "DEBUG" / "MONITOR" / "RUN"
+status.HasFatalError()                // true if any fatal error flag is set
+status.HasError(gofins.FatalIOBus)    // true if that specific flag is set
+
+raw, err := client.ReadPLCStatus()    // raw 0601 response, if you want to parse it yourself
 ```
 
 ### Byte Order

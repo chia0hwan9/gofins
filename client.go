@@ -371,17 +371,86 @@ func (c *Client) Status() (*PLCStatus, error) {
 	return s, nil
 }
 
+// StatusCode 是 0601 响应 byte[0] 的运行状态（与上游 mapping.StatusCode 取值一致）。
+type StatusCode uint8
+
+const (
+	StatusStop    StatusCode = 0x00 // Program not being executed
+	StatusRun     StatusCode = 0x01 // Program being executed
+	StatusStandby StatusCode = 0x80 // CPU on standby
+)
+
+func (s StatusCode) String() string {
+	switch s {
+	case StatusStop:
+		return "STOP"
+	case StatusRun:
+		return "RUN"
+	case StatusStandby:
+		return "STANDBY"
+	default:
+		return fmt.Sprintf("UNKNOWN(0x%02X)", uint8(s))
+	}
+}
+
+// ModeCode 是 0601 响应 byte[1] 的运行模式（与上游 mapping.ModeCode 取值一致）。
+type ModeCode uint8
+
+const (
+	ModeProgram ModeCode = 0x00
+	ModeDebug   ModeCode = 0x01
+	ModeMonitor ModeCode = 0x02
+	ModeRun     ModeCode = 0x04
+)
+
+func (m ModeCode) String() string {
+	switch m {
+	case ModeProgram:
+		return "PROGRAM"
+	case ModeDebug:
+		return "DEBUG"
+	case ModeMonitor:
+		return "MONITOR"
+	case ModeRun:
+		return "RUN"
+	default:
+		return fmt.Sprintf("UNKNOWN(0x%02X)", uint8(m))
+	}
+}
+
+// StatusCode 返回语义化的运行状态（PLCStatus.Status 原样保留为字节，避免破坏已有调用方）。
+func (s *PLCStatus) StatusCode() StatusCode { return StatusCode(s.Status) }
+
+// ModeCode 返回语义化的运行模式。
+func (s *PLCStatus) ModeCode() ModeCode { return ModeCode(s.Mode) }
+
 // IsRunning returns true if the PLC is in RUN mode.
-func (s *PLCStatus) IsRunning() bool { return s.Status == 0x01 }
+func (s *PLCStatus) IsRunning() bool { return s.StatusCode() == StatusRun }
 
 // IsStopped returns true if the PLC is in STOP mode.
-func (s *PLCStatus) IsStopped() bool { return s.Status == 0x00 }
+func (s *PLCStatus) IsStopped() bool { return s.StatusCode() == StatusStop }
 
 // IsStandby returns true if the PLC is in STANDBY mode.
-func (s *PLCStatus) IsStandby() bool { return s.Status == 0x80 }
+func (s *PLCStatus) IsStandby() bool { return s.StatusCode() == StatusStandby }
+
+// IsProgramMode / IsDebugMode / IsMonitorMode / IsRunMode 对应 0601 的 Mode 字节。
+func (s *PLCStatus) IsProgramMode() bool { return s.ModeCode() == ModeProgram }
+func (s *PLCStatus) IsDebugMode() bool   { return s.ModeCode() == ModeDebug }
+func (s *PLCStatus) IsMonitorMode() bool { return s.ModeCode() == ModeMonitor }
+func (s *PLCStatus) IsRunMode() bool     { return s.ModeCode() == ModeRun }
 
 // HasFatalError returns true if any fatal error flag is set.
 func (s *PLCStatus) HasFatalError() bool { return s.FatalError != 0 }
+
+// HasError 判断某类致命错误标志是否置位（等价上游 PLCStatus.HasError）。
+func (s *PLCStatus) HasError(errType FatalErrorCode) bool { return s.FatalError&errType != 0 }
+
+// ReadPLCStatus 返回 0601 的原始响应（不解析），供上层自行解析或现场排查——
+// 上游 folke99/gofins 有同名方法；Status() 是按 18 字节布局解析后的结果。
+func (c *Client) ReadPLCStatus() (Response, error) {
+	command, data := statusReadCommand()
+	return c.do(command, data)
+}
 
 // ---------- Ping ----------
 

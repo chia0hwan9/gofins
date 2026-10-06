@@ -87,6 +87,11 @@ func (h Header) IsCommand() bool {
 	return h.ICF&icfMessageTypeBit == 0
 }
 
+// IsResponseRequired returns true if the sender expects a response (ICF bit 0 == 0).
+func (h Header) IsResponseRequired() bool {
+	return h.ICF&icfNoResponseBit == 0
+}
+
 // String returns a human-readable representation.
 func (h Header) String() string {
 	return fmt.Sprintf("ICF=0x%02X GCT=%d DNA=%d DA1=%d DA2=%d SNA=%d SA1=%d SA2=%d SID=%d",
