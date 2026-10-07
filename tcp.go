@@ -24,6 +24,15 @@ const (
 
 	defaultConnectTimeout  = 5 * time.Second
 	defaultResponseTimeout = 10 * time.Second
+
+	// 自动重连默认策略：最多 3 次尝试、首次退避 1s（1s → 2s，上限 10s）。
+	// Send 里的重连是"发之前先把连接建好"，最坏阻塞 ≈ 3s；Close() 能打断退避。
+	defaultReconnectAttempts = 3
+	defaultReconnectBackoff  = time.Second
+	maxReconnectBackoff      = 10 * time.Second
+
+	// OS 级 TCP keepalive 默认周期。
+	defaultTCPKeepAlivePeriod = 30 * time.Second
 )
 
 // wrapFINSTCPFrame 给 payload 加 FINS/TCP 头。payload 是第 8 字节之后的部分：
@@ -40,21 +49,45 @@ func wrapFINSTCPFrame(payload []byte) []byte {
 	return frame
 }
 
+// wrapDataFrame 把裸 FINS 帧打成 FINS/TCP 数据帧（命令=2、错误码=0）。
+// 客户端发送与模拟器应答共用，保证两侧分帧一致。
+func wrapDataFrame(finsFrame []byte) []byte {
+	payload := make([]byte, 8+len(finsFrame))
+	binary.BigEndian.PutUint32(payload[0:4], finsCmdData)
+	copy(payload[8:], finsFrame)
+	return wrapFINSTCPFrame(payload)
+}
+
 // TCPTransport implements FINS over TCP with FINS init frame wrapping,
 // persistent connection, handshake and SID management.
-// 断线重连由调用方负责（与项目内其它连接器库一致：网关自己管退避重试）。
+//
+// 自动重连默认**开启**（SetReconnect(false) 关掉）：连接断了以后，下一次 Send 会先按
+// 退避策略把连接重新建起来再发这一条。自己管重连的上层（例如网关的通道重连调度）
+// 应当关掉它，避免两套重连叠加。
+//
+// 注意：断在"发送途中"的请求不会被自动重发——写命令可能已经到达 PLC，重发会造成
+// 重复写入；这类失败原样返回错误，由调用方决定是否重试（读命令可安全重试）。
 type TCPTransport struct {
-	addr              string
-	node, unit, netw  byte // Source FINS address
-	plcNode           byte // PLC node (learned from handshake)
-	timeout           time.Duration
-	keepaliveInterval time.Duration
+	addr             string
+	node, unit, netw byte // Source FINS address
+	plcNode          byte // PLC node (learned from handshake)
+	timeout          time.Duration
+
+	keepaliveInterval  time.Duration // 应用层：周期性 FINS status read
+	tcpKeepAlive       bool          // OS 级 SO_KEEPALIVE
+	tcpKeepAlivePeriod time.Duration
+
+	reconnect         bool
+	reconnectAttempts int
+	reconnectBackoff  time.Duration
 
 	conn     net.Conn
 	reader   *bufio.Reader
 	mu       sync.Mutex
-	sid      byte // Next SID
+	gen      int // 连接世代：旧读循环退出时不得清掉新世代的 conn
+	sid      byte
 	closed   bool
+	closedCh chan struct{}
 	stopKeep chan struct{}
 
 	resp   map[byte]chan tcpResult
@@ -71,12 +104,18 @@ type tcpResult struct {
 // addr: "host:port", srcNode/srcUnit: source FINS address.
 func NewTCPTransport(addr string, srcNode, srcUnit, srcNetwork byte) *TCPTransport {
 	return &TCPTransport{
-		addr:    addr,
-		node:    srcNode,
-		unit:    srcUnit,
-		netw:    srcNetwork,
-		timeout: defaultResponseTimeout,
-		resp:    make(map[byte]chan tcpResult),
+		addr:               addr,
+		node:               srcNode,
+		unit:               srcUnit,
+		netw:               srcNetwork,
+		timeout:            defaultResponseTimeout,
+		tcpKeepAlive:       true,
+		tcpKeepAlivePeriod: defaultTCPKeepAlivePeriod,
+		reconnect:          true,
+		reconnectAttempts:  defaultReconnectAttempts,
+		reconnectBackoff:   defaultReconnectBackoff,
+		closedCh:           make(chan struct{}),
+		resp:               make(map[byte]chan tcpResult),
 	}
 }
 
@@ -87,7 +126,8 @@ func (t *TCPTransport) SetTimeout(d time.Duration) {
 	t.timeout = d
 }
 
-// SetKeepalive sets the keepalive interval (0 to disable).
+// SetKeepalive 设置应用层 keepalive 周期：每隔该时长发一次 FINS status read（0 = 关）。
+// 它能发现"TCP 还活着但 PLC 不响应"的情况；OS 级探测见 SetTCPKeepAlive。
 func (t *TCPTransport) SetKeepalive(interval time.Duration) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -95,6 +135,61 @@ func (t *TCPTransport) SetKeepalive(interval time.Duration) {
 	if t.conn != nil && interval > 0 {
 		t.startKeepaliveLocked()
 	}
+}
+
+// SetTCPKeepAlive 设置 OS 级 TCP keepalive（默认开，周期 30s）。
+// 与 SetKeepalive 互补：内核负责探测半开连接，应用层负责探测"连接在但 PLC 不回"。
+func (t *TCPTransport) SetTCPKeepAlive(enabled bool, period time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.tcpKeepAlive = enabled
+	if period > 0 {
+		t.tcpKeepAlivePeriod = period
+	}
+	t.applyTCPKeepAliveLocked()
+}
+
+func (t *TCPTransport) applyTCPKeepAliveLocked() {
+	tc, ok := t.conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	if t.tcpKeepAlive {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(t.tcpKeepAlivePeriod)
+		return
+	}
+	_ = tc.SetKeepAlive(false)
+}
+
+// SetReconnect 打开/关闭自动重连（默认开）。
+func (t *TCPTransport) SetReconnect(enabled bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.reconnect = enabled
+}
+
+// IsConnected 报告当前是否已连接（连接存在且已完成握手）。
+// 连接器/网关卡的状态判断用得上：断线后这里是 false，Send 会按需重连。
+func (t *TCPTransport) IsConnected() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn != nil
+}
+
+// SetReconnectPolicy 设置重连策略：最多尝试 attempts 次、首次退避 initialBackoff
+// （之后按 2 倍递增，上限 10s）。attempts < 1 视为 1，backoff <= 0 用默认 1s。
+func (t *TCPTransport) SetReconnectPolicy(attempts int, initialBackoff time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if attempts < 1 {
+		attempts = 1
+	}
+	if initialBackoff <= 0 {
+		initialBackoff = defaultReconnectBackoff
+	}
+	t.reconnectAttempts = attempts
+	t.reconnectBackoff = initialBackoff
 }
 
 // Connect establishes the TCP connection and performs the FINS handshake.
@@ -108,7 +203,91 @@ func (t *TCPTransport) Connect() error {
 	if t.conn != nil {
 		return nil // Already connected
 	}
+	return t.dialLocked()
+}
 
+// Reconnect 关闭当前连接（若有）并按退避策略重新拨号 + 握手。
+// 旧世代上在途的请求会立刻拿到 ConnectionClosedError，而不是各自等到响应超时；
+// Close() 会打断退避等待。自动重连关闭时也可以手动调用它。
+func (t *TCPTransport) Reconnect() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return ConnectionClosedError{}
+	}
+	attempts, backoff := t.reconnectAttempts, t.reconnectBackoff
+	t.mu.Unlock()
+
+	if err := t.dropConn(); err != nil {
+		return err
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			select {
+			case <-time.After(nextBackoff(backoff, attempt)):
+			case <-t.closedCh:
+				return ConnectionClosedError{}
+			}
+		}
+		t.mu.Lock()
+		if t.closed {
+			t.mu.Unlock()
+			return ConnectionClosedError{}
+		}
+		err := t.dialLocked()
+		t.mu.Unlock()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("FINS/TCP 重连失败（已尝试 %d 次）: %w", attempts, lastErr)
+}
+
+// nextBackoff 第 attempt 次尝试前的退避：backoff, 2×backoff, …（上限 10s）。
+func nextBackoff(backoff time.Duration, attempt int) time.Duration {
+	d := backoff
+	for i := 2; i < attempt; i++ {
+		d *= 2
+		if d >= maxReconnectBackoff {
+			return maxReconnectBackoff
+		}
+	}
+	if d > maxReconnectBackoff {
+		return maxReconnectBackoff
+	}
+	return d
+}
+
+// dropConn 断掉当前连接，并让该世代在途的等待者立刻失败。
+// gen 递增后旧读循环的收尾不会清掉新世代的 conn。
+func (t *TCPTransport) dropConn() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return ConnectionClosedError{}
+	}
+	conn := t.conn
+	t.conn = nil
+	t.reader = nil
+	t.gen++
+	if t.stopKeep != nil {
+		close(t.stopKeep)
+		t.stopKeep = nil
+	}
+	t.mu.Unlock()
+
+	if conn != nil {
+		_ = conn.Close()
+	}
+	t.failAllWaiters(ConnectionClosedError{})
+	return nil
+}
+
+// dialLocked 拨号 + 握手 + 启动本世代读循环。必须持有 t.mu。
+func (t *TCPTransport) dialLocked() error {
 	dialer := net.Dialer{Timeout: defaultConnectTimeout}
 	conn, err := dialer.Dial("tcp", t.addr)
 	if err != nil {
@@ -117,20 +296,23 @@ func (t *TCPTransport) Connect() error {
 
 	t.conn = conn
 	t.reader = bufio.NewReader(conn)
+	t.applyTCPKeepAliveLocked()
 
 	if err := t.handshakeLocked(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		t.conn = nil
 		t.reader = nil
 		return fmt.Errorf("FINS handshake failed: %w", err)
 	}
 
-	go t.listenLoop()
+	t.gen++
+	gen := t.gen
+	reader := t.reader // 随连接一起传给读循环：不能在 goroutine 里再读 t.reader（重连会把它置 nil）
+	go t.listenLoop(gen, reader)
 
 	if t.keepaliveInterval > 0 {
 		t.startKeepaliveLocked()
 	}
-
 	return nil
 }
 
@@ -177,19 +359,45 @@ func (t *TCPTransport) handshakeLocked() error {
 	return nil
 }
 
+// ensureConnected 发送前确认连接可用：连接已断且自动重连开着时先重连。
+func (t *TCPTransport) ensureConnected() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return ConnectionClosedError{}
+	}
+	connected, auto := t.conn != nil, t.reconnect
+	t.mu.Unlock()
+
+	if connected {
+		return nil
+	}
+	if !auto {
+		return NotConnectedError{}
+	}
+	return t.Reconnect()
+}
+
 // Send sends a raw FINS frame (no TCP wrapping) and returns the raw response.
 // The TCP wrapping (FINS init frame) is added/removed internally.
+//
+// 自动重连开着时，连接已断会先重连再发这一条；断在发送途中的请求不自动重发（见类型注释）。
 func (t *TCPTransport) Send(frame []byte) ([]byte, error) {
-	// Fast path: lock, check state
+	if err := t.ensureConnected(); err != nil {
+		return nil, err
+	}
+
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
 		return nil, ConnectionClosedError{}
 	}
-	if t.conn == nil {
+	conn := t.conn
+	if conn == nil {
 		t.mu.Unlock()
 		return nil, NotConnectedError{}
 	}
+	timeout := t.timeout
 
 	// Get next SID and inject into frame header byte 9 (SID field)
 	sid := t.nextSIDLocked()
@@ -200,11 +408,7 @@ func (t *TCPTransport) Send(frame []byte) ([]byte, error) {
 
 	// Build TCP-wrapped frame: FINS/TCP header (16) + raw FINS frame。
 	// payload = 命令(4) + 错误码(4) + FINS 帧 → Length = 8 + len(frame)。
-	payload := make([]byte, 8+len(frame))
-	binary.BigEndian.PutUint32(payload[0:4], finsCmdData)
-	binary.BigEndian.PutUint32(payload[4:8], 0) // Error code = 0
-	copy(payload[8:], frame)
-	wrappedFrame := wrapFINSTCPFrame(payload)
+	wrappedFrame := wrapDataFrame(frame)
 
 	// Create response channel before sending
 	respCh := make(chan tcpResult, 1)
@@ -219,7 +423,7 @@ func (t *TCPTransport) Send(frame []byte) ([]byte, error) {
 		t.respMu.Unlock()
 	}()
 
-	if _, err := t.conn.Write(wrappedFrame); err != nil {
+	if _, err := conn.Write(wrappedFrame); err != nil {
 		t.mu.Unlock()
 		return nil, fmt.Errorf("TCP write: %w", err)
 	}
@@ -235,8 +439,8 @@ func (t *TCPTransport) Send(frame []byte) ([]byte, error) {
 			return nil, r.err
 		}
 		return EncodeResponse(r.resp), nil
-	case <-time.After(t.timeout):
-		return nil, ResponseTimeoutError{Duration: t.timeout}
+	case <-time.After(timeout):
+		return nil, ResponseTimeoutError{Duration: timeout}
 	}
 }
 
@@ -250,21 +454,25 @@ func (t *TCPTransport) nextSIDLocked() byte {
 }
 
 // listenLoop reads TCP frames, unwraps FINS init frame, and dispatches responses by SID.
-func (t *TCPTransport) listenLoop() {
+// gen 是本次连接的世代号：收尾时只有仍属当前世代才清理 conn 与在途请求，
+// 否则会把重连后的新连接一起清掉。reader 是本世代自己的读缓冲（重连不会影响它）。
+func (t *TCPTransport) listenLoop(gen int, reader *bufio.Reader) {
 	defer func() {
 		t.mu.Lock()
-		t.conn = nil
+		current := t.gen == gen
+		if current {
+			t.conn = nil
+			t.reader = nil
+		}
 		t.mu.Unlock()
 
-		t.respMu.Lock()
-		for sid, ch := range t.resp {
-			close(ch)
-			delete(t.resp, sid)
+		if current {
+			// 本世代断了：让在途请求立刻失败，而不是各自等到响应超时
+			t.failAllWaiters(ConnectionClosedError{})
 		}
-		t.respMu.Unlock()
 	}()
 
-	scanner := bufio.NewScanner(t.reader)
+	scanner := bufio.NewScanner(reader)
 	scanBuf := make([]byte, maxFrameLength)
 	scanner.Buffer(scanBuf, maxFrameLength)
 	scanner.Split(finsSplitFunc)
@@ -311,9 +519,23 @@ func (t *TCPTransport) listenLoop() {
 		default:
 			log.Printf("FINS: response channel full for SID %d", resp.Header.SID)
 		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("FINS scanner error: %v", err)
+	}
+
+	if err := scanner.Err(); err != nil {
+		log.Printf("FINS scanner error: %v", err)
+	}
+}
+
+// failAllWaiters 让所有在途等待者立刻拿到错误（断线/重连/关闭时用）。
+func (t *TCPTransport) failAllWaiters(err error) {
+	t.respMu.Lock()
+	defer t.respMu.Unlock()
+	for sid, ch := range t.resp {
+		select {
+		case ch <- tcpResult{err: err}:
+		default:
 		}
+		delete(t.resp, sid)
 	}
 }
 
@@ -386,9 +608,12 @@ func (t *TCPTransport) startKeepaliveLocked() {
 		for {
 			select {
 			case <-ticker.C:
-				// Send status read as keepalive（SID 由 Send 用传输自己的计数器覆盖）
-				command, data := statusReadCommand()
+				// Send status read as keepalive（SID 由 Send 用传输自己的计数器覆盖）。
+				// 节点号在重连握手时会被改写，取用要持锁。
+				t.mu.Lock()
 				header := NewCommandHeader(t.plcNode, 0, t.node, t.unit, 0)
+				t.mu.Unlock()
+				command, data := statusReadCommand()
 				t.Send(EncodeRequest(Request{Header: header, Command: command, Data: data})) // Ignore errors
 			case <-t.stopKeep:
 				return
@@ -397,19 +622,29 @@ func (t *TCPTransport) startKeepaliveLocked() {
 	}()
 }
 
-// Close closes the connection and cleans up.
+// Close closes the connection and cleans up. 它是终态：之后再 Send/Connect 都返回
+// ConnectionClosedError（不会悄悄重连）；自动重连的退避等待会被立刻打断。
 func (t *TCPTransport) Close() error {
 	t.mu.Lock()
-	defer t.mu.Unlock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
 	t.closed = true
+	close(t.closedCh)
 	if t.stopKeep != nil {
 		close(t.stopKeep)
 		t.stopKeep = nil
 	}
-	if t.conn != nil {
-		err := t.conn.Close()
-		t.conn = nil
-		return err
+	conn := t.conn
+	t.conn = nil
+	t.reader = nil
+	t.gen++ // 让读循环的收尾不再清理
+	t.mu.Unlock()
+
+	t.failAllWaiters(ConnectionClosedError{})
+	if conn != nil {
+		return conn.Close()
 	}
 	return nil
 }

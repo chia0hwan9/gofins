@@ -26,15 +26,6 @@ func writeCommand(ma MemoryAddress, dataBytes []byte) (uint16, []byte) {
 	return CmdMemoryWrite, buf
 }
 
-// fillCommand builds a request to fill a range of words with a constant value.
-func fillCommand(ma MemoryAddress, count uint16, fillWord uint16) (uint16, []byte) {
-	data := make([]byte, 0, 8)
-	data = append(data, ma.Encode()...) // 4 bytes
-	data = append(data, byte(count>>8), byte(count&0xFF))
-	data = append(data, byte(fillWord>>8), byte(fillWord&0xFF))
-	return CmdMemoryFill, data
-}
-
 // readBitsCommand builds a request to read bits from a bit-accessible area.
 // Data format: area(1) + address(2) + bit(1) + itemCount(2) = 6 bytes
 // itemCount 是**位数**（2 字节）——位读写用的是同一个 0101/0102 命令格式，

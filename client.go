@@ -53,6 +53,27 @@ func (c *Client) SetTimeout(d time.Duration) {
 	c.transport.SetTimeout(d)
 }
 
+// SetReconnect 打开/关闭底层传输的自动重连（默认开，仅 TCPTransport 支持）。
+// 网关自己管重连（通道级退避调度）时调 SetReconnect(false)，避免两套重连叠加。
+// 传输不支持该能力时返回 false。
+func (c *Client) SetReconnect(enabled bool) bool {
+	r, ok := c.transport.(Reconnecter)
+	if !ok {
+		return false
+	}
+	r.SetReconnect(enabled)
+	return true
+}
+
+// Reconnect 显式重连底层传输（目前仅 TCPTransport 支持）。
+func (c *Client) Reconnect() error {
+	r, ok := c.transport.(Reconnecter)
+	if !ok {
+		return ProtocolError{Msg: "transport does not support reconnect"}
+	}
+	return r.Reconnect()
+}
+
 // SetByteOrder sets the byte order for word read/write operations. Default: BigEndian.
 // 读写双向都生效（读解码与写编码用同一个设置）。
 func (c *Client) SetByteOrder(order binary.ByteOrder) {

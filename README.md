@@ -15,7 +15,8 @@ Merged and refined from [folke99/gofins](https://github.com/folke99/gofins) (TCP
 - **Bit access**: `CIO`, `WR`, `HR`, `AR`, `DM`, timer/counter flags
 - **BCD encoding**: built-in BCD encode/decode for clock and numeric values
 - **PLC control**: Run, Stop, Clock read/write, Status
-- **Keepalive**: optional periodic status polling on TCP connections
+- **Keepalive**: optional periodic status polling on TCP connections (plus OS-level TCP keepalive)
+- **Auto-reconnect**: on by default for TCP, with backoff; `SetReconnect(false)` when your own layer owns reconnection (e.g. a gateway channel scheduler)
 - **Goroutine-safe**: one `Client` can be shared — request/response cycles, SID allocation and byte order are serialized internally (one command in flight at a time)
 - **Error handling**: typed errors for timeouts, end codes, protocol violations
 - **Pluggable transport**: implement `Transport` for custom transports
@@ -94,15 +95,25 @@ words, err := client.ReadWords(gofins.MemAreaDM, 100, 10)
 
 ```go
 t := gofins.NewTCPTransport("192.168.1.100:9600", 1, 0, 0)
-t.SetTimeout(5 * time.Second)         // Response timeout (default: 10s)
-t.SetKeepalive(30 * time.Second)      // Periodic status polling
-t.Connect()                           // Establishes TCP + FINS handshake
+t.SetTimeout(5 * time.Second)            // Response timeout (default: 10s)
+t.SetKeepalive(30 * time.Second)         // App-level: periodic FINS status read (0 = off)
+t.SetTCPKeepAlive(true, 30*time.Second)  // OS-level SO_KEEPALIVE (default: on, 30s)
+t.SetReconnect(true)                     // Auto-reconnect (default: on)
+t.SetReconnectPolicy(3, time.Second)     // At most 3 tries, first backoff 1s (1s → 2s, cap 10s)
+t.Connect()                              // Establishes TCP + FINS handshake
+t.IsConnected()                          // Connection state (after handshake)
 ```
 
-> **Reconnect is the caller's job.** The transports do not reconnect on their own: after a
-> failure `Send` returns `NotConnectedError` until you `Close()` the transport and build a new
-> one. This matches the gateway-side design of the projects this library is used from, where one
-> reconnect scheduler owns every channel (backoff, de-duplication, logging in one place).
+> **Auto-reconnect semantics.** When it is on, a `Send` that finds the connection gone first
+> re-establishes it (handshake included) and then sends that one command. A request that fails
+> *mid-flight* is **not** replayed — a write may already have reached the PLC, so replaying could
+> duplicate it; the error is returned and the caller decides whether to retry. `Reconnect()` forces
+> a reconnect (and is also available when auto-reconnect is off). `Close()` is final and interrupts
+> any backoff wait.
+>
+> Call `SetReconnect(false)` when an outer layer already owns reconnection (the gateway this library
+> is used from does exactly that: one channel-level scheduler with backoff, de-duplication and
+> logging), so the two do not fight.
 
 ### UDP Options
 
@@ -222,17 +233,18 @@ shorter than requested is an error too (it is never silently zero-filled).
 err := client.Ping()                  // Sends status read to verify connectivity
 ```
 
-## PLC Simulator (UDP only)
+## PLC Simulator (UDP + TCP)
 
 Built-in simulator for testing without hardware:
 
 ```go
 server := gofins.NewServer()
-go server.ListenAndServe("127.0.0.1:0")
-defer server.Stop()
+go server.ListenAndServe("127.0.0.1:0")       // UDP
+// or: go server.ListenAndServeTCP("127.0.0.1:0")  // FINS/TCP (handshake + framing)
+defer server.Stop()                            // closes the listener and any open connections
 
 addr := server.Addr().String()
-transport, _ := gofins.NewUDPTransport(addr)
+transport, _ := gofins.NewUDPTransport(addr)   // or gofins.NewTCPTransport(addr, 0, 0, 0)
 client := gofins.NewClient(transport, 1, 0, 2, 0, 0)
 
 client.WriteWords(gofins.MemAreaDM, 100, []uint16{0xABCD})
@@ -240,9 +252,10 @@ words, _ := client.ReadWords(gofins.MemAreaDM, 100, 1)
 fmt.Printf("Read back: 0x%04X\n", words[0]) // 0xABCD
 ```
 
-> The simulator models **word and bit** areas (DM/CIO/WR/HR/AR word + bit codes, clock, status),
-> so `ReadBits`/`WriteBits`/`SetBit` can be exercised against it: bit 0 is the LSB of the word, and
-> accesses crossing a word boundary carry into the next word.
+> The simulator models **word and bit** areas (DM/CIO/WR/HR/AR word + bit codes, clock, status,
+> run/stop, address-range checking with end code `0x1104`), and the same handlers serve both
+> transports. Bit 0 is the LSB of the word, and accesses crossing a word boundary carry into the
+> next word.
 
 ### Custom Command Handlers
 

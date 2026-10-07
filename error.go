@@ -25,21 +25,6 @@ func (e ResponseTimeoutError) Error() string {
 	return fmt.Sprintf("response timeout after %v", e.Duration)
 }
 
-// TimeoutError occurs when a request exceeds the timeout.
-type TimeoutError struct {
-	Duration time.Duration
-}
-
-func (e TimeoutError) Error() string {
-	return fmt.Sprintf("FINS operation timed out after %v", e.Duration)
-}
-
-// Timeout implements the net.Error interface.
-func (e TimeoutError) Timeout() bool { return true }
-
-// Temporary implements the net.Error interface.
-func (e TimeoutError) Temporary() bool { return true }
-
 // ProtocolError indicates malformed or unexpected protocol data.
 type ProtocolError struct {
 	Msg string

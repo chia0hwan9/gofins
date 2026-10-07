@@ -58,6 +58,13 @@ func (t *UDPTransport) SetTimeout(d time.Duration) {
 	t.timeout = d
 }
 
+// IsConnected 报告 socket 是否已建立（UDP 无连接语义，仅表示 socket 可用）。
+func (t *UDPTransport) IsConnected() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.conn != nil && !t.closed
+}
+
 // Send sends a raw FINS frame and waits for the response.
 func (t *UDPTransport) Send(frame []byte) ([]byte, error) {
 	t.mu.Lock()

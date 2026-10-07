@@ -2,15 +2,18 @@ package gofins
 
 import (
 	"encoding/binary"
+	"io"
 	"log"
 	"net"
 	"sync"
 	"time"
 )
 
-// Server is a simple FINS UDP server that simulates a PLC for testing.
+// Server is a FINS PLC simulator（UDP 与 TCP 两种模式共用同一套 handler 与内存）。
 type Server struct {
-	conn     *net.UDPConn
+	conn     *net.UDPConn          // UDP 模式
+	listener net.Listener          // TCP 模式
+	conns    map[net.Conn]struct{} // TCP 活动连接（Stop 时一并关闭）
 	mu       sync.RWMutex
 	memory   map[MemoryArea]map[uint16][]byte // Word-aligned storage per area
 	handlers map[uint16]CommandHandlerFunc
@@ -20,11 +23,12 @@ type Server struct {
 // CommandHandlerFunc handles a FINS command and returns response data (excluding header, command, end code).
 type CommandHandlerFunc func(req Request) ([]byte, error)
 
-// NewServer creates a new UDP server with default handlers.
+// NewServer creates a new simulator with default handlers.
 func NewServer() *Server {
 	s := &Server{
 		memory:   make(map[MemoryArea]map[uint16][]byte),
 		handlers: make(map[uint16]CommandHandlerFunc),
+		conns:    make(map[net.Conn]struct{}),
 	}
 	s.RegisterHandler(CmdMemoryRead, s.handleMemoryRead)
 	s.RegisterHandler(CmdMemoryWrite, s.handleMemoryWrite)
@@ -40,6 +44,96 @@ func (s *Server) RegisterHandler(cmd uint16, fn CommandHandlerFunc) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handlers[cmd] = fn
+}
+
+// ListenAndServeTCP 起一个 FINS/TCP 模拟器（16 字节 FINS/TCP 头 + 握手 + 分帧），
+// 每个连接一个 goroutine，handler/内存与 UDP 模式共用。阻塞到 Stop()。
+func (s *Server) ListenAndServeTCP(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.listener = ln
+	s.mu.Unlock()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			s.mu.RLock()
+			closed := s.closed
+			s.mu.RUnlock()
+			if closed {
+				return nil
+			}
+			log.Printf("FINS server accept error: %v", err)
+			return err
+		}
+		go s.serveTCPConn(conn)
+	}
+}
+
+// serveTCPConn 处理一条 FINS/TCP 连接：握手 → 按 Length 分帧收请求 → 回响应。
+func (s *Server) serveTCPConn(conn net.Conn) {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		_ = conn.Close()
+		return
+	}
+	s.conns[conn] = struct{}{}
+	s.mu.Unlock()
+	defer func() {
+		s.mu.Lock()
+		delete(s.conns, conn)
+		s.mu.Unlock()
+		_ = conn.Close()
+	}()
+
+	// 握手：20 字节请求（Length=12）→ 24 字节响应（Length=16）
+	hs := make([]byte, 20)
+	if _, err := io.ReadFull(conn, hs); err != nil {
+		return
+	}
+	if string(hs[0:4]) != finsMagic || binary.BigEndian.Uint32(hs[4:8]) != 12 {
+		return
+	}
+	resp := make([]byte, 24)
+	copy(resp[0:4], finsMagic)
+	binary.BigEndian.PutUint32(resp[4:8], 16) // Length = 24-8
+	binary.BigEndian.PutUint32(resp[8:12], finsCmdHandshakeRsp)
+	binary.BigEndian.PutUint32(resp[12:16], 0) // error code
+	resp[19] = 11                              // 分配给客户端的节点号
+	resp[23] = 1                               // PLC 节点号
+	if _, err := conn.Write(resp); err != nil {
+		return
+	}
+
+	head := make([]byte, 8)
+	for {
+		if _, err := io.ReadFull(conn, head); err != nil {
+			return
+		}
+		if string(head[0:4]) != finsMagic {
+			return
+		}
+		length := binary.BigEndian.Uint32(head[4:8])
+		if length < 8 || length > maxFrameLength {
+			return
+		}
+		payload := make([]byte, length)
+		if _, err := io.ReadFull(conn, payload); err != nil {
+			return
+		}
+		// payload = 命令(4) + 错误码(4) + FINS 帧
+		frame, err := s.processFrame(payload[8:])
+		if err != nil {
+			return
+		}
+		if _, err := conn.Write(wrapDataFrame(frame)); err != nil {
+			return
+		}
+	}
 }
 
 // ListenAndServe starts the UDP server on the given address. Blocks until Stop() is called.
@@ -215,9 +309,11 @@ func (s *Server) handleMemoryRead(req Request) ([]byte, error) {
 	if len(req.Data) < 6 {
 		return nil, ProtocolError{Msg: "read command too short"}
 	}
-	area := MemoryArea(req.Data[0])
-	address := binary.BigEndian.Uint16(req.Data[1:3])
-	bitOffset := req.Data[3]
+	ma, err := DecodeMemoryAddress(req.Data[0:4])
+	if err != nil {
+		return nil, err
+	}
+	area, address, bitOffset := ma.Area, ma.Address, ma.BitOffset
 	count := binary.BigEndian.Uint16(req.Data[4:6])
 	if count == 0 {
 		return nil, ProtocolError{Msg: "read item count is zero"}
@@ -271,9 +367,11 @@ func (s *Server) handleMemoryWrite(req Request) ([]byte, error) {
 	if len(req.Data) < 6 {
 		return nil, ProtocolError{Msg: "write command too short"}
 	}
-	area := MemoryArea(req.Data[0])
-	address := binary.BigEndian.Uint16(req.Data[1:3])
-	bitOffset := req.Data[3]
+	ma, err := DecodeMemoryAddress(req.Data[0:4])
+	if err != nil {
+		return nil, err
+	}
+	area, address, bitOffset := ma.Area, ma.Address, ma.BitOffset
 	count := binary.BigEndian.Uint16(req.Data[4:6])
 	payload := req.Data[6:]
 
@@ -337,25 +435,45 @@ func (s *Server) handleStatusRead(req Request) ([]byte, error) {
 	return statusData, nil
 }
 
-// Stop closes the UDP socket.
+// Stop closes the UDP socket / TCP listener and all active TCP connections.
 func (s *Server) Stop() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.closed = true
+	var err error
 	if s.conn != nil {
-		err := s.conn.Close()
+		err = s.conn.Close()
 		s.conn = nil
-		return err
 	}
-	return nil
+	if s.listener != nil {
+		if lerr := s.listener.Close(); err == nil {
+			err = lerr
+		}
+		s.listener = nil
+	}
+	conns := make([]net.Conn, 0, len(s.conns))
+	for c := range s.conns {
+		conns = append(conns, c)
+	}
+	s.conns = make(map[net.Conn]struct{})
+	s.mu.Unlock()
+
+	// 已建立的连接不会随 listener 关闭而断开，这里显式关掉（模拟器停掉 = 拔线）
+	for _, c := range conns {
+		_ = c.Close()
+	}
+	return err
 }
 
-// Addr returns the server's local address (valid after ListenAndServe is called).
+// Addr returns the server's local address (valid after ListenAndServe /
+// ListenAndServeTCP is called).
 func (s *Server) Addr() net.Addr {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if s.conn != nil {
 		return s.conn.LocalAddr()
+	}
+	if s.listener != nil {
+		return s.listener.Addr()
 	}
 	return nil
 }
